@@ -1,0 +1,151 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Root Access â Storage (020)
+  Creates the private S3 bucket that serves as the origin for the CloudFront
+  distribution. Direct public access is blocked; assets are served exclusively
+  through CloudFront using an Origin Access Control (OAC).
+  An optional separate bucket for CloudFront access logs is also created.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [prod, staging, dev]
+    Default: prod
+    Description: Deployment environment name.
+
+  EnableAccessLogs:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Whether to create a separate bucket for CloudFront access logs.
+
+Conditions:
+  CreateLogsBucket: !Equals [!Ref EnableAccessLogs, "true"]
+
+Resources:
+
+  # ââ UI Assets Bucket âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+  # Stores the compiled PWA artefacts (HTML, JS, CSS, service worker).
+  # Static website hosting is intentionally DISABLED â CloudFront + OAC
+  # accesses the bucket as a standard S3 origin, which is the recommended
+  # pattern for private origins.
+  UIBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "root-access-${Environment}-ui"
+      # Versioning keeps previous deployments recoverable for fast rollbacks.
+      VersioningConfiguration:
+        Status: Enabled
+      # Block all public access â assets are served via CloudFront only.
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Encrypt at rest using the default S3-managed key (SSE-S3).
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      Tags:
+        - Key: Project
+          Value: root-access
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: Repository
+          Value: root-access-infrastructure
+
+  # ââ Bucket Policy ââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+  # Grants CloudFront's service principal read access using OAC.
+  # The OAC itself is created in the 040-cdn.yaml stack; this policy grants
+  # the CloudFront service principal access to all distributions in the account
+  # (narrowed further by the aws:SourceArn condition added in 040-cdn.yaml).
+  UIBucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref UIBucket
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: AllowCloudFrontOAC
+            Effect: Allow
+            Principal:
+              Service: cloudfront.amazonaws.com
+            Action: s3:GetObject
+            Resource: !Sub "${UIBucket.Arn}/*"
+            Condition:
+              StringEquals:
+                # Restrict access to CloudFront distributions in this account only.
+                aws:SourceAccount: !Ref AWS::AccountId
+
+  # ââ Access Logs Bucket âââââââââââââââââââââââââââââââââââââââââââââââââââââ
+  # Receives CloudFront standard access logs. Separate bucket per AWS best
+  # practice (log buckets must not be the same as the origin bucket).
+  AccessLogsBucket:
+    Type: AWS::S3::Bucket
+    Condition: CreateLogsBucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketName: !Sub "root-access-${Environment}-access-logs"
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      # Automatically expire log files after 90 days to control storage costs.
+      LifecycleConfiguration:
+        Rules:
+          - Id: ExpireOldLogs
+            Status: Enabled
+            ExpirationInDays: 90
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault:
+              SSEAlgorithm: AES256
+      OwnershipControls:
+        Rules:
+          - ObjectOwnership: BucketOwnerPreferred
+      Tags:
+        - Key: Project
+          Value: root-access
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ââ Store bucket name in SSM for cross-stack and CI/CD reference ââââââââââ
+  UIBucketNameParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/root-access/${Environment}/ui-bucket-name"
+      Type: String
+      Value: !Ref UIBucket
+      Description: "S3 bucket name for root-access-ui static assets."
+      Tags:
+        Project: root-access
+        Environment: !Ref Environment
+
+Outputs:
+  UIBucketName:
+    Description: "Name of the S3 bucket storing the root-access-ui assets."
+    Value: !Ref UIBucket
+    Export:
+      Name: !Sub "root-access-${Environment}-ui-bucket-name"
+
+  UIBucketArn:
+    Description: "ARN of the S3 bucket storing the root-access-ui assets."
+    Value: !GetAtt UIBucket.Arn
+    Export:
+      Name: !Sub "root-access-${Environment}-ui-bucket-arn"
+
+  AccessLogsBucketName:
+    Condition: CreateLogsBucket
+    Description: "Name of the S3 bucket for CloudFront access logs."
+    Value: !Ref AccessLogsBucket
+    Export:
+      Name: !Sub "root-access-${Environment}-access-logs-bucket-name"
