@@ -1,0 +1,95 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Root Access â TLS Certificate (030)
+  Provisions an ACM certificate for the custom domain.
+
+  !! IMPORTANT â REGION CONSTRAINT !!
+  This stack MUST be deployed to us-east-1 (US East / N. Virginia), regardless
+  of the primary application region. CloudFront requires ACM certificates to
+  exist in us-east-1. Deploying to any other region will result in CloudFront
+  being unable to use the certificate.
+
+  Deploy command:
+    aws cloudformation deploy \
+      --template-file cloudformation/030-certificate.yaml \
+      --stack-name root-access-prod-certificate \
+      --region us-east-1 \
+      --parameter-overrides DomainName=root-access.example.com
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [prod, staging, dev]
+    Default: prod
+    Description: Deployment environment name.
+
+  DomainName:
+    Type: String
+    Description: |
+      Primary domain name for the game (e.g. root-access.example.com).
+      A certificate will be issued for both the apex and www. subdomain.
+
+  HostedZoneId:
+    Type: String
+    Description: |
+      Route 53 Hosted Zone ID for the domain. Required for automatic DNS
+      validation. If you do not use Route 53, omit this parameter and validate
+      the certificate manually via the AWS Console or email.
+    Default: ""
+
+Conditions:
+  UseRoute53Validation: !Not [!Equals [!Ref HostedZoneId, ""]]
+
+Resources:
+
+  # ââ ACM Certificate ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+  # DNS validation is preferred: it renews automatically as long as the DNS
+  # record remains in place. Email validation requires manual re-validation
+  # at each renewal cycle.
+  Certificate:
+    Type: AWS::CertificateManager::Certificate
+    Properties:
+      DomainName: !Ref DomainName
+      SubjectAlternativeNames:
+        - !Sub "www.${DomainName}"
+      ValidationMethod: DNS
+      # When HostedZoneId is provided, CloudFormation creates the DNS
+      # validation records automatically.
+      DomainValidationOptions: !If
+        - UseRoute53Validation
+        - - DomainName: !Ref DomainName
+            HostedZoneId: !Ref HostedZoneId
+          - DomainName: !Sub "www.${DomainName}"
+            HostedZoneId: !Ref HostedZoneId
+        - !Ref AWS::NoValue
+      Tags:
+        - Key: Project
+          Value: root-access
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: Repository
+          Value: root-access-infrastructure
+
+  # ââ Store certificate ARN in SSM âââââââââââââââââââââââââââââââââââââââââââ
+  # The CDN stack (040) imports this value to attach the certificate to the
+  # CloudFront distribution. Storing in SSM avoids cross-region CloudFormation
+  # export limitations (exports are region-scoped; us-east-1 exports are not
+  # directly importable by stacks in eu-west-1).
+  CertificateArnParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      # Use a global path so the CDN stack (in another region) can read it
+      # if both stacks share the same AWS account and SSM region access.
+      Name: !Sub "/root-access/${Environment}/certificate-arn"
+      Type: String
+      Value: !Ref Certificate
+      Description: "ACM certificate ARN for root-access CloudFront distribution (us-east-1)."
+
+Outputs:
+  CertificateArn:
+    Description: |
+      ARN of the ACM certificate. Pass this as the AcmCertificateArn parameter
+      when deploying 040-cdn.yaml. Note: this ARN is in us-east-1.
+    Value: !Ref Certificate
