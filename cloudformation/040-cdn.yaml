@@ -1,0 +1,182 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Root Access â CloudFront CDN (040)
+  Creates the CloudFront distribution that serves the root-access-ui PWA
+  globally. Uses Origin Access Control (OAC) to securely access the private
+  S3 bucket created in 020-storage.yaml. Handles SPA client-side routing by
+  mapping 403/404 S3 errors to index.html with a 200 response.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [prod, staging, dev]
+    Default: prod
+    Description: Deployment environment name.
+
+  AcmCertificateArn:
+    Type: String
+    Default: ""
+    Description: |
+      ARN of the ACM certificate in us-east-1 (from 030-certificate.yaml output).
+      Leave empty to serve the distribution on the default *.cloudfront.net domain
+      without a custom domain or HTTPS certificate.
+
+  DomainName:
+    Type: String
+    Default: ""
+    Description: |
+      Custom domain name (e.g. root-access.example.com). Must match the
+      certificate. Leave empty to use the CloudFront default domain.
+
+  EnableAccessLogs:
+    Type: String
+    AllowedValues: ["true", "false"]
+    Default: "true"
+    Description: Enable CloudFront standard access logs to the logs S3 bucket.
+
+Conditions:
+  UseCustomDomain: !Not [!Equals [!Ref DomainName, ""]]
+  UseCertificate:  !Not [!Equals [!Ref AcmCertificateArn, ""]]
+  EnableLogs:      !Equals [!Ref EnableAccessLogs, "true"]
+
+Resources:
+
+  # ââ Origin Access Control ââââââââââââââââââââââââââââââââââââââââââââââââââ
+  # OAC is the modern replacement for Origin Access Identity (OAI).
+  # It signs requests to S3 with SigV4, providing stronger security.
+  OriginAccessControl:
+    Type: AWS::CloudFront::OriginAccessControl
+    Properties:
+      OriginAccessControlConfig:
+        Name: !Sub "root-access-${Environment}-oac"
+        Description: "OAC for root-access-ui S3 origin"
+        OriginAccessControlOriginType: s3
+        SigningBehavior: always
+        SigningProtocol: sigv4
+
+  # ââ Cache Policy âââââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+  # Aggressive caching for immutable hashed assets (JS/CSS/images).
+  # index.html and service worker are NOT cached (handled via CacheControl
+  # headers set during S3 sync in the deploy workflow).
+  HashedAssetsCachePolicy:
+    Type: AWS::CloudFront::CachePolicy
+    Properties:
+      CachePolicyConfig:
+        Name: !Sub "root-access-${Environment}-hashed-assets"
+        Comment: "1-year cache for Vite content-hashed static assets."
+        DefaultTTL: 31536000   # 1 year
+        MaxTTL: 31536000
+        MinTTL: 31536000
+        ParametersInCacheKeyAndForwardedToOrigin:
+          EnableAcceptEncodingGzip: true
+          EnableAcceptEncodingBrotli: true
+          CookiesConfig:
+            CookieBehavior: none
+          HeadersConfig:
+            HeaderBehavior: none
+          QueryStringsConfig:
+            QueryStringBehavior: none
+
+  # ââ CloudFront Distribution ââââââââââââââââââââââââââââââââââââââââââââââââ
+  Distribution:
+    Type: AWS::CloudFront::Distribution
+    Properties:
+      DistributionConfig:
+        Comment: !Sub "root-access-${Environment} PWA distribution"
+        Enabled: true
+        HttpVersion: http2and3
+        IPV6Enabled: true
+        PriceClass: PriceClass_100  # US, Canada, Europe â sufficient for target audience
+
+        # Custom domain aliases; only set when a domain is provided.
+        Aliases: !If
+          - UseCustomDomain
+          - [!Ref DomainName, !Sub "www.${DomainName}"]
+          - !Ref AWS::NoValue
+
+        # HTTPS configuration.
+        ViewerCertificate: !If
+          - UseCertificate
+          - AcmCertificateArn: !Ref AcmCertificateArn
+            SslSupportMethod: sni-only
+            MinimumProtocolVersion: TLSv1.2_2021
+          - CloudFrontDefaultCertificate: true
+
+        # S3 origin â private bucket accessed via OAC.
+        Origins:
+          - Id: UIBucketOrigin
+            DomainName: !Sub
+              - "${BucketName}.s3.${AWS::Region}.amazonaws.com"
+              - BucketName: !ImportValue
+                  Fn::Sub: "root-access-${Environment}-ui-bucket-name"
+            S3OriginConfig:
+              # Empty string required when using OAC (not OAI).
+              OriginAccessIdentity: ""
+            OriginAccessControlId: !GetAtt OriginAccessControl.Id
+
+        # Default behaviour: serve index.html for all paths (SPA routing).
+        DefaultCacheBehavior:
+          TargetOriginId: UIBucketOrigin
+          ViewerProtocolPolicy: redirect-to-https
+          CachePolicyId: !Ref HashedAssetsCachePolicy
+          # Compress assets at the edge.
+          Compress: true
+          AllowedMethods: [GET, HEAD, OPTIONS]
+          CachedMethods: [GET, HEAD]
+
+        DefaultRootObject: index.html
+
+        # SPA routing: map S3 403/404 errors to index.html so that React Router
+        # can handle the path on the client side.
+        CustomErrorResponses:
+          - ErrorCode: 403
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+          - ErrorCode: 404
+            ResponseCode: 200
+            ResponsePagePath: /index.html
+            ErrorCachingMinTTL: 0
+
+        # Access logging (optional).
+        Logging: !If
+          - EnableLogs
+          - Bucket: !Sub
+              - "${LogsBucket}.s3.amazonaws.com"
+              - LogsBucket: !ImportValue
+                  Fn::Sub: "root-access-${Environment}-access-logs-bucket-name"
+            Prefix: cloudfront/
+            IncludeCookies: false
+          - !Ref AWS::NoValue
+
+      Tags:
+        - Key: Project
+          Value: root-access
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: Repository
+          Value: root-access-infrastructure
+
+  # ââ Store distribution ID in SSM for CI/CD use ââââââââââââââââââââââââââââ
+  DistributionIdParameter:
+    Type: AWS::SSM::Parameter
+    Properties:
+      Name: !Sub "/root-access/${Environment}/cloudfront-distribution-id"
+      Type: String
+      Value: !GetAtt Distribution.Id
+      Description: "CloudFront distribution ID used for cache invalidation in CI/CD."
+
+Outputs:
+  DistributionId:
+    Description: "CloudFront distribution ID. Used to create cache invalidations."
+    Value: !GetAtt Distribution.Id
+    Export:
+      Name: !Sub "root-access-${Environment}-cloudfront-distribution-id"
+
+  DistributionDomainName:
+    Description: "Default CloudFront domain name (*.cloudfront.net)."
+    Value: !GetAtt Distribution.DomainName
+    Export:
+      Name: !Sub "root-access-${Environment}-cloudfront-domain"
