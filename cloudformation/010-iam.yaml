@@ -1,0 +1,135 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Description: |
+  Root Access â IAM Foundation (010)
+  Creates the GitHub Actions OIDC Identity Provider and the least-privilege
+  deployment role used by all CI/CD workflows in the root-access project.
+  This stack must be deployed first; all other stacks depend on its outputs.
+
+Parameters:
+  Environment:
+    Type: String
+    AllowedValues: [prod, staging, dev]
+    Default: prod
+    Description: Deployment environment name.
+
+  GitHubOrg:
+    Type: String
+    Default: fischermichael199
+    Description: GitHub organisation or user account name (case-sensitive).
+
+  GitHubRepoUI:
+    Type: String
+    Default: root-access-ui
+    Description: GitHub repository name for the UI application.
+
+Resources:
+
+  # ââ GitHub OIDC Identity Provider âââââââââââââââââââââââââââââââââââââââââ
+  # Allows GitHub Actions to assume AWS roles without storing long-lived keys.
+  # Only one OIDC provider per URL may exist per account; this resource is
+  # idempotent if the provider already exists.
+  GitHubOIDCProvider:
+    Type: AWS::IAM::OIDCProvider
+    Properties:
+      Url: https://token.actions.githubusercontent.com
+      ClientIdList:
+        - sts.amazonaws.com
+      # Thumbprints rotate; using the well-known GitHub value as of 2024.
+      ThumbprintList:
+        - 6938fd4d98bab03faadb97b34396831e3780aea1
+        - 1c58a3a8518e8759bf075b76b750d4f2df264fcd
+      Tags:
+        - Key: Project
+          Value: root-access
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+
+  # ââ Deployment Role ââââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+  # Assumed by GitHub Actions workflows via OIDC. Grants least-privilege access
+  # to push static assets to S3 and invalidate CloudFront caches.
+  DeploymentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub "root-access-${Environment}-github-deploy"
+      Description: "Assumed by GitHub Actions to deploy root-access-ui to S3 + CloudFront."
+      MaxSessionDuration: 3600
+      AssumeRolePolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: GitHubActionsOIDC
+            Effect: Allow
+            Principal:
+              Federated: !GetAtt GitHubOIDCProvider.Arn
+            Action: sts:AssumeRoleWithWebIdentity
+            Condition:
+              StringEquals:
+                token.actions.githubusercontent.com:aud: sts.amazonaws.com
+              # Restrict to the specific repo and branch to minimise blast radius.
+              StringLike:
+                token.actions.githubusercontent.com:sub:
+                  !Sub "repo:${GitHubOrg}/${GitHubRepoUI}:ref:refs/heads/main"
+      Tags:
+        - Key: Project
+          Value: root-access
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: ManagedBy
+          Value: cloudformation
+        - Key: Repository
+          Value: root-access-infrastructure
+
+  # ââ Deployment Policy âââââââââââââââââââââââââââââââââââââââââââââââââââââââ
+  # Grants only the permissions required to:
+  #   - Sync the built PWA assets to the S3 bucket.
+  #   - Create a CloudFront invalidation to flush the CDN cache.
+  # The S3 bucket ARN and CloudFront distribution ID are resolved at deploy time
+  # via SSM Parameter Store to avoid circular stack dependencies.
+  DeploymentPolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      ManagedPolicyName: !Sub "root-access-${Environment}-deploy-policy"
+      Description: "Least-privilege policy for root-access CI/CD deployments."
+      Roles:
+        - !Ref DeploymentRole
+      PolicyDocument:
+        Version: "2012-10-17"
+        Statement:
+          - Sid: S3SyncAssets
+            Effect: Allow
+            Action:
+              - s3:PutObject
+              - s3:DeleteObject
+              - s3:GetObject
+              - s3:ListBucket
+            Resource:
+              - !Sub "arn:aws:s3:::root-access-${Environment}-ui"
+              - !Sub "arn:aws:s3:::root-access-${Environment}-ui/*"
+          - Sid: CloudFrontInvalidate
+            Effect: Allow
+            Action:
+              - cloudfront:CreateInvalidation
+            # The distribution ARN is not known at IAM stack deploy time;
+            # allow invalidation on any distribution owned by this account.
+            Resource: !Sub "arn:aws:cloudfront::${AWS::AccountId}:distribution/*"
+          - Sid: ReadDeploymentParameters
+            Effect: Allow
+            Action:
+              - ssm:GetParameter
+              - ssm:GetParameters
+            Resource:
+              - !Sub "arn:aws:ssm:${AWS::Region}:${AWS::AccountId}:parameter/root-access/${Environment}/*"
+
+Outputs:
+  OIDCProviderArn:
+    Description: "ARN of the GitHub OIDC Identity Provider."
+    Value: !GetAtt GitHubOIDCProvider.Arn
+    Export:
+      Name: !Sub "root-access-${Environment}-oidc-provider-arn"
+
+  DeploymentRoleArn:
+    Description: "ARN of the IAM role assumed by GitHub Actions during deployment."
+    Value: !GetAtt DeploymentRole.Arn
+    Export:
+      Name: !Sub "root-access-${Environment}-deploy-role-arn"
