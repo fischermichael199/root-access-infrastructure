@@ -1,0 +1,8 @@
+# AWS CLI output and temp files
+*.out
+.aws-sam/
+
+# Editor artifacts
+.DS_Store
+*.swp
+.vscode/
